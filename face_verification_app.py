@@ -1432,6 +1432,13 @@ class FaceVerificationApp(QMainWindow):
 
         layout.addStretch()
 
+        self.db_viewer_btn = GlowButton("Database Viewer", "#1abc9c")
+        self.db_viewer_btn.setToolTip("Open Database Viewer")
+        self.db_viewer_btn.clicked.connect(self.open_db_viewer)
+        layout.addWidget(self.db_viewer_btn)
+
+        layout.addSpacing(10)
+
         shortcuts_label = QLabel("Shortcuts:")
         shortcuts_label.setStyleSheet("color: rgba(255, 255, 255, 0.7); font-size: 10px; background: transparent;")
         layout.addWidget(shortcuts_label)
@@ -1836,6 +1843,35 @@ class FaceVerificationApp(QMainWindow):
     def toggle_sound(self, state):
         self.sound_enabled = state == Qt.Checked
         self.log(f"Sound {'enabled' if self.sound_enabled else 'disabled'}")
+
+    def open_db_viewer(self):
+        """Open the Database Viewer application"""
+        import subprocess
+        import os
+        import sys
+
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            db_viewer_path = os.path.join(script_dir, 'db_viewer.py')
+
+            if not os.path.exists(db_viewer_path):
+                from PyQt5.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "Error", f"Nu am găsit db_viewer.py în:\n{script_dir}")
+                return
+
+            if sys.platform == 'win32':
+                subprocess.Popen([sys.executable, db_viewer_path],
+                                 creationflags=subprocess.CREATE_NEW_CONSOLE)
+            else:
+                subprocess.Popen([sys.executable, db_viewer_path],
+                                 start_new_session=True)
+
+            self.log("Database Viewer opened")
+
+        except Exception as e:
+            self.log(f"Failed to open Database Viewer: {e}")
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Error", f"Nu am putut deschide Database Viewer:\n{e}")
 
     def toggle_freeze_frame(self):
         if not self.is_running:
