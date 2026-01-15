@@ -4,7 +4,7 @@ expertMode = true
 
 [nix]
 channel = "stable-25_05"
-packages = ["cmake", "freetype", "gcc", "glib", "lcms2", "libGL", "libGLU", "libgcc", "libimagequant", "libjpeg", "libtiff", "libwebp", "libxcrypt", "openjpeg", "pkg-config", "python3Full", "tcl", "tk", "unixODBC", "xsimd", "zlib", "xorg.libxcb", "xorg.xcbutilwm", "xorg.xcbutilimage", "xorg.xcbutilkeysyms", "xorg.xcbutilrenderutil", "xorg.libX11", "libxkbcommon", "qt5.qtbase"]
+packages = ["cmake", "freetype", "gcc", "glib", "lcms2", "libGL", "libGLU", "libgcc", "libimagequant", "libjpeg", "libtiff", "libwebp", "libxcrypt", "openjpeg", "pkg-config", "python3Full", "tcl", "tk", "unixODBC", "xsimd", "zlib", "xorg.libxcb", "xorg.xcbutilwm", "xorg.xcbutilimage", "xorg.xcbutilkeysyms", "xorg.xcbutilrenderutil", "xorg.libX11", "libxkbcommon", "qt5.qtbase", "xorg.libXrender", "xorg.libXi", "fontconfig", "xorg.xorgserver", "krb5"]
 
 [workflows]
 runButton = "Project"
@@ -28,3 +28,6 @@ outputType = "vnc"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "QT_QPA_PLATFORM=vnc python face_verification_app.py"
+
+[deployment]
+deploymentTarget = "cloudrun"
