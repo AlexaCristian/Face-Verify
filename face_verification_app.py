@@ -1,43 +1,32 @@
 """
 Face Verification System - Ring Camera Style
 =============================================
-A Windows desktop application for face verification using machine learning.
-Connect to your SQL Server (SSMS) database for storing and verifying faces.
-
-REQUIREMENTS (install on Windows):
-    pip install opencv-python numpy pyodbc Pillow scipy PyQt5
-
-USAGE:
-    python face_verification_app.py
-
-Make sure your SQL Server has:
-1. ODBC Driver 17 for SQL Server installed
-2. A database created (app will create tables automatically)
+A desktop application for face verification using machine learning.
+Uses local SQLite database - works immediately without external setup.
 """
 
 import sys
 import os
+import sqlite3
+import threading
+from datetime import datetime
 
 try:
     import cv2
     import numpy as np
-    import pyodbc
     from scipy.spatial.distance import cosine
     from PIL import Image
     from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                  QHBoxLayout, QLabel, QPushButton, QLineEdit, 
                                  QTextEdit, QGroupBox, QMessageBox, QFileDialog,
-                                 QFrame)
+                                 QFrame, QCheckBox)
     from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QMutex, QMutexLocker
     from PyQt5.QtGui import QImage, QPixmap, QFont, QPalette, QColor
 except ImportError as e:
     print(f"Missing required package: {e}")
     print("\nPlease install required packages with:")
-    print("    pip install opencv-python numpy pyodbc Pillow scipy PyQt5")
+    print("    pip install opencv-python numpy Pillow scipy PyQt5")
     sys.exit(1)
-
-import threading
-from datetime import datetime
 
 
 class FaceEncoder:
@@ -49,10 +38,10 @@ class FaceEncoder:
         if image is None:
             return None
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-        faces = self.face_cascade.detectMultiScale(gray, 1.3, 5)
+        faces = self.face_cascade.detectMultiScale(gray, 1.1, 4, minSize=(60, 60))
         if len(faces) == 0:
             return None
-        x, y, w, h = faces[0]
+        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
         return gray[y:y+h, x:x+w]
     
     def get_encoding(self, image):
@@ -143,8 +132,105 @@ class FaceEncoder:
         e2 = e2 / (np.linalg.norm(e2) + 1e-10)
         
         similarity = 1 - cosine(e1, e2)
-        
         return max(0, min(1, similarity))
+
+
+class LocalDatabase:
+    def __init__(self, db_path="faces.db"):
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        self._init_db()
+        
+    def _init_db(self):
+        with self.lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS RegisteredFaces (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    person_name TEXT NOT NULL,
+                    face_encoding TEXT NOT NULL,
+                    face_image BLOB,
+                    registered_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS VerificationLog (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    person_name TEXT,
+                    verification_result TEXT,
+                    confidence REAL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+            conn.close()
+            
+    def get_connection(self):
+        return sqlite3.connect(self.db_path)
+    
+    def add_face(self, name, encoding, image_bytes):
+        encoding_str = ','.join([str(x) for x in encoding])
+        with self.lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO RegisteredFaces (person_name, face_encoding, face_image) VALUES (?, ?, ?)",
+                (name, encoding_str, image_bytes)
+            )
+            conn.commit()
+            conn.close()
+            
+    def get_all_faces(self):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, person_name, face_encoding FROM RegisteredFaces")
+        rows = cursor.fetchall()
+        conn.close()
+        
+        faces = {}
+        for row in rows:
+            person_id, name, encoding_str = row
+            try:
+                encoding = np.array([float(x) for x in encoding_str.split(',')])
+                if name not in faces:
+                    faces[name] = []
+                faces[name].append({'id': person_id, 'encoding': encoding})
+            except:
+                pass
+        return faces
+    
+    def get_persons_list(self):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT person_name, COUNT(*) as face_count, MAX(registered_date) as last_registered 
+            FROM RegisteredFaces 
+            GROUP BY person_name 
+            ORDER BY last_registered DESC
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+    
+    def log_verification(self, person_name, result, confidence):
+        with self.lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO VerificationLog (person_name, verification_result, confidence) VALUES (?, ?, ?)",
+                (person_name, result, confidence)
+            )
+            conn.commit()
+            conn.close()
+            
+    def delete_person(self, name):
+        with self.lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM RegisteredFaces WHERE person_name = ?", (name,))
+            conn.commit()
+            conn.close()
 
 
 class SignalBridge(QObject):
@@ -152,12 +238,13 @@ class SignalBridge(QObject):
     status_signal = pyqtSignal(str, str)
     verification_signal = pyqtSignal(str, str)
     message_signal = pyqtSignal(str, str, str)
+    update_faces_signal = pyqtSignal()
 
 
 class FaceVerificationApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Face Verification System - Ring Camera Style")
+        self.setWindowTitle("Face Verification System")
         self.setGeometry(100, 100, 1200, 800)
         self.setMinimumSize(1000, 700)
         self.setStyleSheet("""
@@ -199,17 +286,17 @@ class FaceVerificationApp(QMainWindow):
                 left: 10px;
                 padding: 0 3px;
             }
+            QCheckBox { color: white; }
         """)
         
+        self.db = LocalDatabase()
         self.cap = None
         self.is_running = False
         self.known_faces = {}
-        self.db_connection = None
-        self.db_config = {}
         self.verification_threshold = 0.70
         self.current_frame = None
+        self.current_image = None
         self.frame_mutex = QMutex()
-        self.db_mutex = QMutex()
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
         self.face_encoder = FaceEncoder()
@@ -219,9 +306,12 @@ class FaceVerificationApp(QMainWindow):
         self.signals.status_signal.connect(self.update_status)
         self.signals.verification_signal.connect(self.update_verification)
         self.signals.message_signal.connect(self.show_message)
+        self.signals.update_faces_signal.connect(self.reload_faces)
         
         self.setup_ui()
-        self.load_config()
+        self.reload_faces()
+        self.log("Application started - Local SQLite database ready")
+        self.log(f"Loaded {sum(len(v) for v in self.known_faces.values())} registered face(s)")
         
     def setup_ui(self):
         central_widget = QWidget()
@@ -235,22 +325,22 @@ class FaceVerificationApp(QMainWindow):
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(15, 15, 15, 15)
         
-        header = QLabel("Live Camera Feed")
+        header = QLabel("Face Verification System")
         header.setFont(QFont("Segoe UI", 18, QFont.Bold))
         header.setStyleSheet("color: #00d4ff; background: transparent;")
         header.setAlignment(Qt.AlignCenter)
         left_layout.addWidget(header)
         
-        self.camera_label = QLabel()
-        self.camera_label.setMinimumSize(640, 480)
-        self.camera_label.setStyleSheet("background-color: #0f0f23; border-radius: 5px; border: 2px solid #333;")
-        self.camera_label.setAlignment(Qt.AlignCenter)
-        self.camera_label.setText("Camera Off\n\nClick 'Start Camera' to begin")
-        left_layout.addWidget(self.camera_label)
+        self.image_label = QLabel()
+        self.image_label.setMinimumSize(640, 480)
+        self.image_label.setStyleSheet("background-color: #0f0f23; border-radius: 5px; border: 2px solid #333;")
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setText("No Image\n\nLoad an image or start camera")
+        left_layout.addWidget(self.image_label)
         
-        self.status_label = QLabel("Status: Camera Off")
+        self.status_label = QLabel("Status: Ready")
         self.status_label.setFont(QFont("Segoe UI", 11))
-        self.status_label.setStyleSheet("color: #ff6b6b; background: transparent;")
+        self.status_label.setStyleSheet("color: #00ff88; background: transparent;")
         self.status_label.setAlignment(Qt.AlignCenter)
         left_layout.addWidget(self.status_label)
         
@@ -258,7 +348,7 @@ class FaceVerificationApp(QMainWindow):
         self.verification_label.setFont(QFont("Segoe UI", 16, QFont.Bold))
         self.verification_label.setStyleSheet("background: transparent;")
         self.verification_label.setAlignment(Qt.AlignCenter)
-        self.verification_label.setMinimumHeight(40)
+        self.verification_label.setMinimumHeight(50)
         left_layout.addWidget(self.verification_label)
         
         main_layout.addWidget(left_panel, stretch=2)
@@ -270,97 +360,80 @@ class FaceVerificationApp(QMainWindow):
         right_layout.setContentsMargins(10, 10, 10, 10)
         right_layout.setSpacing(10)
         
-        db_group = QGroupBox("SQL Server Connection")
-        db_layout = QVBoxLayout(db_group)
-        db_layout.setSpacing(5)
+        source_group = QGroupBox("Image Source")
+        source_layout = QVBoxLayout(source_group)
         
-        db_layout.addWidget(QLabel("Server (e.g., localhost or .\\SQLEXPRESS):"))
-        self.server_entry = QLineEdit()
-        self.server_entry.setText("localhost")
-        self.server_entry.setPlaceholderText("Enter SQL Server name...")
-        db_layout.addWidget(self.server_entry)
+        self.load_image_btn = QPushButton("Load Image from File")
+        self.load_image_btn.setStyleSheet("background-color: #1e88e5;")
+        self.load_image_btn.clicked.connect(self.load_image)
+        source_layout.addWidget(self.load_image_btn)
         
-        db_layout.addWidget(QLabel("Database Name:"))
-        self.database_entry = QLineEdit()
-        self.database_entry.setText("FaceVerificationDB")
-        self.database_entry.setPlaceholderText("Enter database name...")
-        db_layout.addWidget(self.database_entry)
+        cam_layout = QHBoxLayout()
+        self.start_cam_btn = QPushButton("Start Camera")
+        self.start_cam_btn.setStyleSheet("background-color: #2e7d32;")
+        self.start_cam_btn.clicked.connect(self.start_camera)
+        cam_layout.addWidget(self.start_cam_btn)
         
-        db_layout.addWidget(QLabel("Username (leave empty for Windows Auth):"))
-        self.username_entry = QLineEdit()
-        self.username_entry.setPlaceholderText("SQL username or blank...")
-        db_layout.addWidget(self.username_entry)
+        self.stop_cam_btn = QPushButton("Stop Camera")
+        self.stop_cam_btn.setStyleSheet("background-color: #c62828;")
+        self.stop_cam_btn.clicked.connect(self.stop_camera)
+        self.stop_cam_btn.setEnabled(False)
+        cam_layout.addWidget(self.stop_cam_btn)
+        source_layout.addLayout(cam_layout)
         
-        db_layout.addWidget(QLabel("Password:"))
-        self.password_entry = QLineEdit()
-        self.password_entry.setEchoMode(QLineEdit.Password)
-        self.password_entry.setPlaceholderText("Password...")
-        db_layout.addWidget(self.password_entry)
+        right_layout.addWidget(source_group)
         
-        self.connect_btn = QPushButton("Connect to Database")
-        self.connect_btn.setStyleSheet("background-color: #1e88e5;")
-        self.connect_btn.clicked.connect(self.connect_database)
-        db_layout.addWidget(self.connect_btn)
+        register_group = QGroupBox("Register New Face")
+        register_layout = QVBoxLayout(register_group)
         
-        self.db_status_label = QLabel("Not Connected")
-        self.db_status_label.setStyleSheet("color: #ff6b6b; background: transparent;")
-        self.db_status_label.setAlignment(Qt.AlignCenter)
-        db_layout.addWidget(self.db_status_label)
-        
-        right_layout.addWidget(db_group)
-        
-        camera_group = QGroupBox("Camera Controls")
-        camera_layout = QVBoxLayout(camera_group)
-        
-        btn_layout = QHBoxLayout()
-        self.start_btn = QPushButton("Start Camera")
-        self.start_btn.setStyleSheet("background-color: #2e7d32;")
-        self.start_btn.clicked.connect(self.start_camera)
-        btn_layout.addWidget(self.start_btn)
-        
-        self.stop_btn = QPushButton("Stop Camera")
-        self.stop_btn.setStyleSheet("background-color: #c62828;")
-        self.stop_btn.clicked.connect(self.stop_camera)
-        self.stop_btn.setEnabled(False)
-        btn_layout.addWidget(self.stop_btn)
-        camera_layout.addLayout(btn_layout)
-        
-        right_layout.addWidget(camera_group)
-        
-        person_group = QGroupBox("Face Registration & Verification")
-        person_layout = QVBoxLayout(person_group)
-        
-        person_layout.addWidget(QLabel("Person Name:"))
+        register_layout.addWidget(QLabel("Person Name:"))
         self.person_name_entry = QLineEdit()
         self.person_name_entry.setPlaceholderText("Enter person's name...")
-        person_layout.addWidget(self.person_name_entry)
+        register_layout.addWidget(self.person_name_entry)
         
-        self.capture_btn = QPushButton("Capture & Register Face")
-        self.capture_btn.setStyleSheet("background-color: #6a1b9a;")
-        self.capture_btn.clicked.connect(self.capture_and_register)
-        person_layout.addWidget(self.capture_btn)
+        self.register_btn = QPushButton("Register Current Face")
+        self.register_btn.setStyleSheet("background-color: #6a1b9a;")
+        self.register_btn.clicked.connect(self.register_face)
+        register_layout.addWidget(self.register_btn)
         
-        self.import_btn = QPushButton("Import Face from Image File")
-        self.import_btn.clicked.connect(self.import_face_from_image)
-        person_layout.addWidget(self.import_btn)
+        right_layout.addWidget(register_group)
+        
+        verify_group = QGroupBox("Verify Identity")
+        verify_layout = QVBoxLayout(verify_group)
         
         self.verify_btn = QPushButton("Verify Current Face")
-        self.verify_btn.setStyleSheet("background-color: #00897b; font-weight: bold;")
+        self.verify_btn.setStyleSheet("background-color: #00897b; font-weight: bold; font-size: 14px; padding: 15px;")
         self.verify_btn.clicked.connect(self.verify_face)
-        person_layout.addWidget(self.verify_btn)
+        verify_layout.addWidget(self.verify_btn)
         
-        self.auto_verify_btn = QPushButton("Toggle Auto-Verify (OFF)")
-        self.auto_verify_btn.clicked.connect(self.toggle_auto_verify)
-        self.auto_verify = False
+        self.auto_verify_cb = QCheckBox("Auto-verify every 2 seconds")
+        self.auto_verify_cb.stateChanged.connect(self.toggle_auto_verify)
+        verify_layout.addWidget(self.auto_verify_cb)
+        
         self.auto_verify_timer = QTimer()
         self.auto_verify_timer.timeout.connect(self.verify_face)
-        person_layout.addWidget(self.auto_verify_btn)
         
-        self.list_btn = QPushButton("List All Registered Persons")
+        right_layout.addWidget(verify_group)
+        
+        manage_group = QGroupBox("Manage Faces")
+        manage_layout = QVBoxLayout(manage_group)
+        
+        self.list_btn = QPushButton("List Registered Persons")
         self.list_btn.clicked.connect(self.list_persons)
-        person_layout.addWidget(self.list_btn)
+        manage_layout.addWidget(self.list_btn)
         
-        right_layout.addWidget(person_group)
+        delete_layout = QHBoxLayout()
+        self.delete_name_entry = QLineEdit()
+        self.delete_name_entry.setPlaceholderText("Name to delete...")
+        delete_layout.addWidget(self.delete_name_entry)
+        
+        self.delete_btn = QPushButton("Delete")
+        self.delete_btn.setStyleSheet("background-color: #c62828;")
+        self.delete_btn.clicked.connect(self.delete_person)
+        delete_layout.addWidget(self.delete_btn)
+        manage_layout.addLayout(delete_layout)
+        
+        right_layout.addWidget(manage_group)
         
         log_group = QGroupBox("Activity Log")
         log_layout = QVBoxLayout(log_group)
@@ -376,16 +449,14 @@ class FaceVerificationApp(QMainWindow):
         
         main_layout.addWidget(right_panel)
         
-    def toggle_auto_verify(self):
-        self.auto_verify = not self.auto_verify
-        if self.auto_verify:
-            self.auto_verify_btn.setText("Toggle Auto-Verify (ON)")
-            self.auto_verify_btn.setStyleSheet("background-color: #2e7d32;")
-            self.auto_verify_timer.start(3000)
-            self.log("Auto-verify enabled (every 3 seconds)")
+    def reload_faces(self):
+        self.known_faces = self.db.get_all_faces()
+        
+    def toggle_auto_verify(self, state):
+        if state == Qt.Checked:
+            self.auto_verify_timer.start(2000)
+            self.log("Auto-verify enabled")
         else:
-            self.auto_verify_btn.setText("Toggle Auto-Verify (OFF)")
-            self.auto_verify_btn.setStyleSheet("")
             self.auto_verify_timer.stop()
             self.log("Auto-verify disabled")
         
@@ -401,7 +472,7 @@ class FaceVerificationApp(QMainWindow):
         
     def update_verification(self, text, color):
         self.verification_label.setText(text)
-        self.verification_label.setStyleSheet(f"color: {color}; background: transparent;")
+        self.verification_label.setStyleSheet(f"color: {color}; background: transparent; font-size: 18px;")
         
     def show_message(self, msg_type, title, message):
         if msg_type == "info":
@@ -414,156 +485,78 @@ class FaceVerificationApp(QMainWindow):
     def log(self, message):
         self.signals.log_signal.emit(message)
     
-    def get_thread_safe_frame(self):
+    def get_current_image(self):
         locker = QMutexLocker(self.frame_mutex)
-        if self.current_frame is not None:
-            return self.current_frame.copy()
+        if self.current_image is not None:
+            return self.current_image.copy()
         return None
-    
-    def get_db_connection_string(self):
-        if self.db_config.get('username'):
-            return f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={self.db_config['server']};DATABASE={self.db_config['database']};UID={self.db_config['username']};PWD={self.db_config['password']}"
-        else:
-            return f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={self.db_config['server']};DATABASE={self.db_config['database']};Trusted_Connection=yes"
-    
-    def get_thread_db_connection(self):
-        return pyodbc.connect(self.get_db_connection_string(), timeout=10)
         
-    def load_config(self):
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db_config.txt")
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, "r") as f:
-                    lines = f.readlines()
-                    if len(lines) >= 2:
-                        self.server_entry.setText(lines[0].strip())
-                        self.database_entry.setText(lines[1].strip())
-            except:
-                pass
-                
-    def save_config(self):
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db_config.txt")
-        with open(config_path, "w") as f:
-            f.write(f"{self.server_entry.text()}\n")
-            f.write(f"{self.database_entry.text()}\n")
-            
-    def connect_database(self):
-        server = self.server_entry.text().strip()
-        database = self.database_entry.text().strip()
-        username = self.username_entry.text().strip()
-        password = self.password_entry.text()
+    def load_image(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Image", "",
+            "Image files (*.jpg *.jpeg *.png *.bmp *.gif)"
+        )
         
-        if not server or not database:
-            QMessageBox.warning(self, "Warning", "Please enter server and database name")
+        if not file_path:
             return
-        
-        self.db_config = {
-            'server': server,
-            'database': database,
-            'username': username,
-            'password': password
-        }
-        
-        try:
-            self.log(f"Connecting to {server}...")
-            self.db_connection = pyodbc.connect(self.get_db_connection_string(), timeout=10)
-            self.create_tables()
-            self.load_known_faces()
-            self.db_status_label.setText("Connected")
-            self.db_status_label.setStyleSheet("color: #00ff88; background: transparent;")
-            self.log(f"Connected to database: {database}")
-            self.save_config()
-        except pyodbc.Error as e:
-            self.db_status_label.setText("Connection Failed")
-            self.db_status_label.setStyleSheet("color: #ff6b6b; background: transparent;")
-            error_msg = str(e)
-            self.log(f"Database error: {error_msg[:100]}")
-            QMessageBox.critical(self, "Database Error", 
-                f"Failed to connect to SQL Server.\n\n"
-                f"Server: {server}\n"
-                f"Database: {database}\n\n"
-                f"Error: {error_msg}\n\n"
-                f"Tips:\n"
-                f"1. Make sure SQL Server is running\n"
-                f"2. Check if the database exists\n"
-                f"3. Verify ODBC Driver 17 is installed\n"
-                f"4. For local instances, try: .\\SQLEXPRESS")
             
-    def create_tables(self):
-        cursor = self.db_connection.cursor()
-        cursor.execute("""
-            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='RegisteredFaces' AND xtype='U')
-            CREATE TABLE RegisteredFaces (
-                id INT IDENTITY(1,1) PRIMARY KEY,
-                person_name NVARCHAR(255) NOT NULL,
-                face_encoding TEXT NOT NULL,
-                face_image VARBINARY(MAX),
-                registered_date DATETIME DEFAULT GETDATE()
-            )
-        """)
-        cursor.execute("""
-            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='VerificationLog' AND xtype='U')
-            CREATE TABLE VerificationLog (
-                id INT IDENTITY(1,1) PRIMARY KEY,
-                person_name NVARCHAR(255),
-                verification_result NVARCHAR(50),
-                confidence FLOAT,
-                timestamp DATETIME DEFAULT GETDATE()
-            )
-        """)
-        self.db_connection.commit()
-        self.log("Database tables ready")
+        image = cv2.imread(file_path)
+        if image is None:
+            self.log("Failed to load image")
+            return
+            
+        locker = QMutexLocker(self.frame_mutex)
+        self.current_image = image.copy()
+        locker.unlock()
         
-    def load_known_faces(self):
-        self.known_faces = {}
-        cursor = self.db_connection.cursor()
-        cursor.execute("SELECT id, person_name, face_encoding FROM RegisteredFaces")
-        rows = cursor.fetchall()
-        for row in rows:
-            person_id, name, encoding_str = row
-            try:
-                encoding = np.array([float(x) for x in encoding_str.split(',')])
-                if name not in self.known_faces:
-                    self.known_faces[name] = []
-                self.known_faces[name].append({'id': person_id, 'encoding': encoding})
-            except Exception as e:
-                self.log(f"Error loading face: {e}")
-        total = sum(len(v) for v in self.known_faces.values())
-        self.log(f"Loaded {total} face(s) for {len(self.known_faces)} person(s)")
+        self.display_image(image)
+        self.log(f"Loaded image: {os.path.basename(file_path)}")
+        self.update_status("Status: Image loaded", "#00ff88")
+        
+    def display_image(self, image):
+        frame_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        faces = self.face_encoder.face_cascade.detectMultiScale(gray, 1.1, 4, minSize=(60, 60))
+        
+        for (x, y, w, h) in faces:
+            cv2.rectangle(frame_rgb, (x, y), (x+w, y+h), (0, 255, 0), 3)
+            cv2.putText(frame_rgb, "Face", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        
+        h, w, ch = frame_rgb.shape
+        bytes_per_line = ch * w
+        qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qt_image)
+        scaled_pixmap = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.image_label.setPixmap(scaled_pixmap)
         
     def start_camera(self):
-        if self.cap is None or not self.cap.isOpened():
-            self.log("Opening camera...")
-            self.cap = cv2.VideoCapture(0)
+        self.log("Starting camera...")
+        self.cap = cv2.VideoCapture(0)
+        
+        if self.cap.isOpened():
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            
-        if self.cap.isOpened():
             self.is_running = True
-            self.start_btn.setEnabled(False)
-            self.stop_btn.setEnabled(True)
-            self.status_label.setText("Status: Camera Running")
-            self.status_label.setStyleSheet("color: #00ff88; background: transparent;")
-            self.log("Camera started successfully")
+            self.start_cam_btn.setEnabled(False)
+            self.stop_cam_btn.setEnabled(True)
+            self.update_status("Status: Camera Running", "#00ff88")
+            self.log("Camera started")
             self.timer.start(33)
         else:
-            QMessageBox.critical(self, "Error", "Could not open camera.\n\nMake sure a webcam is connected.")
-            self.log("Failed to open camera")
+            self.log("No camera found - use 'Load Image' instead")
+            self.update_status("Status: No camera available", "#ff6b6b")
+            QMessageBox.warning(self, "Camera", "No camera detected.\n\nUse 'Load Image from File' to test with photos.")
             
     def stop_camera(self):
         self.is_running = False
         self.timer.stop()
-        if self.auto_verify:
-            self.toggle_auto_verify()
         if self.cap:
             self.cap.release()
             self.cap = None
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.status_label.setText("Status: Camera Off")
-        self.status_label.setStyleSheet("color: #ff6b6b; background: transparent;")
-        self.camera_label.setText("Camera Off\n\nClick 'Start Camera' to begin")
-        self.camera_label.setPixmap(QPixmap())
+        self.start_cam_btn.setEnabled(True)
+        self.stop_cam_btn.setEnabled(False)
+        self.update_status("Status: Camera stopped", "#ffaa00")
         self.log("Camera stopped")
         
     def update_frame(self):
@@ -571,30 +564,14 @@ class FaceVerificationApp(QMainWindow):
             ret, frame = self.cap.read()
             if ret:
                 locker = QMutexLocker(self.frame_mutex)
-                self.current_frame = frame.copy()
+                self.current_image = frame.copy()
                 locker.unlock()
+                self.display_image(frame)
                 
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                faces = self.face_encoder.face_cascade.detectMultiScale(gray, 1.3, 5)
-                
-                for (x, y, w, h) in faces:
-                    cv2.rectangle(frame_rgb, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                    cv2.putText(frame_rgb, "Face Detected", (x, y-10), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                
-                h, w, ch = frame_rgb.shape
-                bytes_per_line = ch * w
-                qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-                pixmap = QPixmap.fromImage(qt_image)
-                scaled_pixmap = pixmap.scaled(self.camera_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.camera_label.setPixmap(scaled_pixmap)
-                
-    def capture_and_register(self):
-        frame = self.get_thread_safe_frame()
-        if frame is None:
-            QMessageBox.warning(self, "Warning", "No frame captured.\n\nStart the camera first.")
+    def register_face(self):
+        image = self.get_current_image()
+        if image is None:
+            QMessageBox.warning(self, "Warning", "No image loaded.\n\nLoad an image or start the camera first.")
             return
             
         name = self.person_name_entry.text().strip()
@@ -602,140 +579,60 @@ class FaceVerificationApp(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please enter a person name")
             return
             
-        if not self.db_connection:
-            QMessageBox.warning(self, "Warning", "Please connect to database first")
-            return
-            
         self.log(f"Registering face for: {name}")
         
-        def register_thread(frame_copy, person_name):
-            encoding = self.face_encoder.get_encoding(frame_copy)
+        def register_thread(img, person_name):
+            encoding = self.face_encoder.get_encoding(img)
             
             if encoding is not None:
-                encoding_str = ','.join([str(x) for x in encoding])
-                
-                _, buffer = cv2.imencode('.jpg', frame_copy)
+                _, buffer = cv2.imencode('.jpg', img)
                 image_bytes = buffer.tobytes()
                 
                 try:
-                    conn = self.get_thread_db_connection()
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "INSERT INTO RegisteredFaces (person_name, face_encoding, face_image) VALUES (?, ?, ?)",
-                        (person_name, encoding_str, image_bytes)
-                    )
-                    conn.commit()
-                    conn.close()
-                    
-                    locker = QMutexLocker(self.db_mutex)
-                    if person_name not in self.known_faces:
-                        self.known_faces[person_name] = []
-                    self.known_faces[person_name].append({'encoding': encoding})
-                    locker.unlock()
-                    
-                    self.signals.log_signal.emit(f"Successfully registered: {person_name}")
+                    self.db.add_face(person_name, encoding, image_bytes)
+                    self.signals.update_faces_signal.emit()
+                    self.signals.log_signal.emit(f"Registered: {person_name}")
                     self.signals.message_signal.emit("info", "Success", f"Face registered for {person_name}")
                 except Exception as e:
-                    self.signals.log_signal.emit(f"Database error: {str(e)}")
-                    self.signals.message_signal.emit("error", "Error", f"Failed to save: {str(e)}")
+                    self.signals.log_signal.emit(f"Error: {str(e)}")
+                    self.signals.message_signal.emit("error", "Error", f"Failed: {str(e)}")
             else:
                 self.signals.log_signal.emit(f"No face detected for: {person_name}")
-                self.signals.message_signal.emit("error", "Error", "No face detected in the frame.\n\nMake sure your face is visible to the camera.")
+                self.signals.message_signal.emit("error", "Error", "No face detected in the image.\n\nMake sure a face is clearly visible.")
                 
-        threading.Thread(target=register_thread, args=(frame, name), daemon=True).start()
-        
-    def import_face_from_image(self):
-        name = self.person_name_entry.text().strip()
-        if not name:
-            QMessageBox.warning(self, "Warning", "Please enter a person name first")
-            return
-            
-        if not self.db_connection:
-            QMessageBox.warning(self, "Warning", "Please connect to database first")
-            return
-            
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select Face Image",
-            "",
-            "Image files (*.jpg *.jpeg *.png *.bmp *.gif)"
-        )
-        
-        if not file_path:
-            return
-            
-        self.log(f"Importing face for: {name}")
-        
-        def import_thread(path, person_name):
-            image = cv2.imread(path)
-            if image is None:
-                self.signals.message_signal.emit("error", "Error", "Could not read the image file")
-                return
-                
-            encoding = self.face_encoder.get_encoding(image)
-            
-            if encoding is not None:
-                encoding_str = ','.join([str(x) for x in encoding])
-                
-                with open(path, 'rb') as f:
-                    image_bytes = f.read()
-                
-                try:
-                    conn = self.get_thread_db_connection()
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "INSERT INTO RegisteredFaces (person_name, face_encoding, face_image) VALUES (?, ?, ?)",
-                        (person_name, encoding_str, image_bytes)
-                    )
-                    conn.commit()
-                    conn.close()
-                    
-                    locker = QMutexLocker(self.db_mutex)
-                    if person_name not in self.known_faces:
-                        self.known_faces[person_name] = []
-                    self.known_faces[person_name].append({'encoding': encoding})
-                    locker.unlock()
-                    
-                    self.signals.log_signal.emit(f"Successfully imported: {person_name}")
-                    self.signals.message_signal.emit("info", "Success", f"Face imported for {person_name}")
-                except Exception as e:
-                    self.signals.message_signal.emit("error", "Error", f"Database error: {str(e)}")
-            else:
-                self.signals.log_signal.emit(f"No face detected in image for: {person_name}")
-                self.signals.message_signal.emit("error", "Error", "No face detected in the selected image")
-                
-        threading.Thread(target=import_thread, args=(file_path, name), daemon=True).start()
+        threading.Thread(target=register_thread, args=(image, name), daemon=True).start()
         
     def verify_face(self):
-        frame = self.get_thread_safe_frame()
-        if frame is None:
-            if not self.auto_verify:
-                QMessageBox.warning(self, "Warning", "No frame captured.\n\nStart the camera first.")
+        image = self.get_current_image()
+        if image is None:
+            if not self.auto_verify_cb.isChecked():
+                QMessageBox.warning(self, "Warning", "No image loaded.\n\nLoad an image or start the camera first.")
             return
             
         if not self.known_faces:
-            if not self.auto_verify:
+            if not self.auto_verify_cb.isChecked():
                 QMessageBox.warning(self, "Warning", "No registered faces.\n\nRegister someone first.")
             return
             
         self.verification_label.setText("Verifying...")
         self.verification_label.setStyleSheet("color: #ffff00; background: transparent;")
         
-        locker = QMutexLocker(self.db_mutex)
-        known_faces_copy = {k: [{'encoding': f['encoding'].copy()} for f in v] for k, v in self.known_faces.items()}
+        locker = QMutexLocker(self.frame_mutex)
+        faces_snapshot = {k: [{'encoding': f['encoding'].copy()} for f in v] for k, v in self.known_faces.items()}
         locker.unlock()
         
-        def verify_thread(frame_copy, faces_snapshot):
-            current_encoding = self.face_encoder.get_encoding(frame_copy)
+        def verify_thread(img, faces):
+            current_encoding = self.face_encoder.get_encoding(img)
             
             if current_encoding is None:
                 self.signals.verification_signal.emit("NO FACE DETECTED", "#ff6b6b")
+                self.signals.log_signal.emit("No face detected")
                 return
                 
             best_match = None
             best_similarity = 0
             
-            for name, face_list in faces_snapshot.items():
+            for name, face_list in faces.items():
                 for face_data in face_list:
                     known_encoding = face_data['encoding']
                     similarity = self.face_encoder.compare_faces(current_encoding, known_encoding)
@@ -756,50 +653,41 @@ class FaceVerificationApp(QMainWindow):
                 if best_match:
                     self.signals.log_signal.emit(f"Unknown (closest: {best_match} at {best_similarity:.1%})")
                 else:
-                    self.signals.log_signal.emit("Unknown person detected")
-                
-            if self.db_config:
-                try:
-                    conn = self.get_thread_db_connection()
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "INSERT INTO VerificationLog (person_name, verification_result, confidence) VALUES (?, ?, ?)",
-                        (best_match or "Unknown", result_status, best_similarity)
-                    )
-                    conn.commit()
-                    conn.close()
-                except:
-                    pass
-                
+                    self.signals.log_signal.emit("Unknown person")
+                    
+            self.db.log_verification(best_match or "Unknown", result_status, best_similarity)
             self.signals.verification_signal.emit(result_text, result_color)
             
-        threading.Thread(target=verify_thread, args=(frame, known_faces_copy), daemon=True).start()
+        threading.Thread(target=verify_thread, args=(image, faces_snapshot), daemon=True).start()
         
     def list_persons(self):
-        if not self.db_connection:
-            QMessageBox.warning(self, "Warning", "Please connect to database first")
-            return
-            
-        cursor = self.db_connection.cursor()
-        cursor.execute("""
-            SELECT person_name, COUNT(*) as face_count, MAX(registered_date) as last_registered 
-            FROM RegisteredFaces 
-            GROUP BY person_name 
-            ORDER BY last_registered DESC
-        """)
-        rows = cursor.fetchall()
+        rows = self.db.get_persons_list()
         
         if not rows:
-            QMessageBox.information(self, "Registered Persons", "No persons registered yet.\n\nUse 'Capture & Register Face' to add someone.")
+            QMessageBox.information(self, "Registered Persons", "No persons registered yet.\n\nUse 'Register Current Face' to add someone.")
             return
             
-        persons_list = "\n".join([f"- {row[0]} ({row[1]} face(s), last: {row[2]})" for row in rows])
+        persons_list = "\n".join([f"- {row[0]} ({row[1]} face(s))" for row in rows])
         QMessageBox.information(self, "Registered Persons", f"Registered faces:\n\n{persons_list}")
+        
+    def delete_person(self):
+        name = self.delete_name_entry.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Warning", "Enter a name to delete")
+            return
+            
+        reply = QMessageBox.question(self, "Confirm Delete", 
+            f"Delete all faces for '{name}'?",
+            QMessageBox.Yes | QMessageBox.No)
+            
+        if reply == QMessageBox.Yes:
+            self.db.delete_person(name)
+            self.reload_faces()
+            self.log(f"Deleted: {name}")
+            self.delete_name_entry.clear()
         
     def closeEvent(self, event):
         self.stop_camera()
-        if self.db_connection:
-            self.db_connection.close()
         event.accept()
 
 
@@ -826,13 +714,11 @@ def main():
     window = FaceVerificationApp()
     window.show()
     
-    print("\n" + "="*60)
-    print("Face Verification System Started!")
-    print("="*60)
-    print("1. Connect to your SQL Server database")
-    print("2. Start the camera")
-    print("3. Register faces or verify identity")
-    print("="*60 + "\n")
+    print("\n" + "="*50)
+    print("Face Verification System - Ready!")
+    print("="*50)
+    print("Using local SQLite database (faces.db)")
+    print("="*50 + "\n")
     
     sys.exit(app.exec_())
 
