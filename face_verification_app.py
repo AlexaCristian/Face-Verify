@@ -1209,6 +1209,10 @@ class FaceVerificationApp(QMainWindow):
         self.scanning_timer = QTimer()
         self.scanning_timer.timeout.connect(self._update_scanning_animation)
 
+        self.db_refresh_timer = QTimer()
+        self.db_refresh_timer.timeout.connect(self._auto_refresh_database)
+        self.db_refresh_timer.start(5000)
+
         self.setup_ui()
         self.setup_keyboard_shortcuts()
         self.reload_faces()
@@ -2004,6 +2008,16 @@ class FaceVerificationApp(QMainWindow):
     def reload_faces(self):
         self.known_faces = self.db.get_all_faces()
         self.signals.update_stats_signal.emit()
+
+    def _auto_refresh_database(self):
+        """Auto-refresh database every 5 seconds to get latest updates"""
+        old_count = sum(len(v) for v in self.known_faces.values())
+        self.known_faces = self.db.get_all_faces()
+        new_count = sum(len(v) for v in self.known_faces.values())
+        if old_count != new_count:
+            self.log(f"Database refreshed: {new_count} face(s)")
+        self.signals.update_stats_signal.emit()
+        self.signals.update_history_signal.emit()
 
     def toggle_auto_verify(self, state):
         if state == Qt.Checked:
