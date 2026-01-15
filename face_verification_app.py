@@ -26,20 +26,221 @@ except ImportError as e:
     sys.exit(1)
 
 
+class LivenessDetector:
+    """Anti-spoofing: Detect if face is real or a photo/screen"""
+    
+    def __init__(self):
+        self.min_score = 0.55
+        
+    def check_liveness(self, image, face_rect):
+        """Returns (is_live, confidence, details)"""
+        if image is None or face_rect is None:
+            return False, 0.0, "No face"
+            
+        x, y, w, h = face_rect
+        pad = int(w * 0.1)
+        x1, y1 = max(0, x - pad), max(0, y - pad)
+        x2, y2 = min(image.shape[1], x + w + pad), min(image.shape[0], y + h + pad)
+        face_region = image[y1:y2, x1:x2]
+        
+        if face_region.size == 0:
+            return False, 0.0, "Invalid region"
+        
+        scores = {}
+        
+        scores['texture'] = self._analyze_texture(face_region)
+        scores['color'] = self._analyze_color(face_region)
+        scores['frequency'] = self._analyze_frequency(face_region)
+        scores['reflection'] = self._detect_reflection(face_region)
+        scores['sharpness'] = self._analyze_sharpness(face_region)
+        scores['skin'] = self._analyze_skin(face_region)
+        scores['noise'] = self._analyze_noise(face_region)
+        scores['gradient'] = self._analyze_gradient(face_region)
+        
+        weights = {
+            'texture': 0.20,
+            'color': 0.15,
+            'frequency': 0.15,
+            'reflection': 0.10,
+            'sharpness': 0.10,
+            'skin': 0.15,
+            'noise': 0.08,
+            'gradient': 0.07
+        }
+        
+        final_score = sum(scores[k] * weights[k] for k in scores)
+        is_live = final_score >= self.min_score
+        
+        details = ", ".join([f"{k}:{v:.2f}" for k, v in scores.items()])
+        return is_live, final_score, details
+    
+    def _analyze_texture(self, face):
+        """LBP texture variance - real faces have more texture variation"""
+        gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY) if len(face.shape) == 3 else face
+        gray = cv2.resize(gray, (64, 64))
+        
+        lbp = np.zeros_like(gray, dtype=np.uint8)
+        for i in range(1, gray.shape[0]-1):
+            for j in range(1, gray.shape[1]-1):
+                center = gray[i, j]
+                code = 0
+                code |= (gray[i-1, j-1] >= center) << 7
+                code |= (gray[i-1, j] >= center) << 6
+                code |= (gray[i-1, j+1] >= center) << 5
+                code |= (gray[i, j+1] >= center) << 4
+                code |= (gray[i+1, j+1] >= center) << 3
+                code |= (gray[i+1, j] >= center) << 2
+                code |= (gray[i+1, j-1] >= center) << 1
+                code |= (gray[i, j-1] >= center) << 0
+                lbp[i-1, j-1] = code
+        
+        variance = np.var(lbp)
+        score = min(1.0, variance / 3000)
+        return score
+    
+    def _analyze_color(self, face):
+        """Color distribution analysis - photos have different color patterns"""
+        hsv = cv2.cvtColor(face, cv2.COLOR_BGR2HSV)
+        
+        h_std = np.std(hsv[:,:,0])
+        s_std = np.std(hsv[:,:,1])
+        v_std = np.std(hsv[:,:,2])
+        
+        s_mean = np.mean(hsv[:,:,1])
+        
+        color_var = (h_std + s_std + v_std) / 3
+        score = min(1.0, color_var / 50)
+        
+        if s_mean < 30:
+            score *= 0.7
+        
+        return score
+    
+    def _analyze_frequency(self, face):
+        """FFT analysis - printed photos have specific frequency patterns"""
+        gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY) if len(face.shape) == 3 else face
+        gray = cv2.resize(gray, (128, 128))
+        
+        f_transform = np.fft.fft2(gray)
+        f_shift = np.fft.fftshift(f_transform)
+        magnitude = np.abs(f_shift)
+        
+        h, w = magnitude.shape
+        center_y, center_x = h // 2, w // 2
+        
+        low_freq = magnitude[center_y-10:center_y+10, center_x-10:center_x+10].mean()
+        high_freq = magnitude.mean()
+        
+        ratio = high_freq / (low_freq + 1e-10)
+        score = min(1.0, ratio * 5)
+        
+        return score
+    
+    def _detect_reflection(self, face):
+        """Detect unnatural reflections from printed/screen photos"""
+        gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY) if len(face.shape) == 3 else face
+        
+        bright_pixels = np.sum(gray > 240)
+        total_pixels = gray.size
+        bright_ratio = bright_pixels / total_pixels
+        
+        if bright_ratio > 0.15:
+            return 0.3
+        elif bright_ratio > 0.08:
+            return 0.6
+        else:
+            return 1.0
+    
+    def _analyze_sharpness(self, face):
+        """Laplacian variance for sharpness - photos of photos are less sharp"""
+        gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY) if len(face.shape) == 3 else face
+        gray = cv2.resize(gray, (100, 100))
+        
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        variance = laplacian.var()
+        
+        score = min(1.0, variance / 500)
+        return score
+    
+    def _analyze_skin(self, face):
+        """Skin color detection in YCrCb space"""
+        ycrcb = cv2.cvtColor(face, cv2.COLOR_BGR2YCrCb)
+        
+        lower_skin = np.array([0, 133, 77], dtype=np.uint8)
+        upper_skin = np.array([255, 173, 127], dtype=np.uint8)
+        
+        skin_mask = cv2.inRange(ycrcb, lower_skin, upper_skin)
+        skin_ratio = np.sum(skin_mask > 0) / skin_mask.size
+        
+        if 0.2 < skin_ratio < 0.8:
+            return 1.0
+        elif 0.1 < skin_ratio < 0.9:
+            return 0.7
+        else:
+            return 0.3
+    
+    def _analyze_noise(self, face):
+        """Noise pattern analysis - screens/prints have different noise"""
+        gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY) if len(face.shape) == 3 else face
+        gray = cv2.resize(gray, (64, 64)).astype(np.float32)
+        
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        noise = np.abs(gray - blurred)
+        noise_std = np.std(noise)
+        
+        if 2 < noise_std < 15:
+            return 1.0
+        elif 1 < noise_std < 20:
+            return 0.6
+        else:
+            return 0.3
+    
+    def _analyze_gradient(self, face):
+        """Gradient consistency - real faces have natural gradient patterns"""
+        gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY) if len(face.shape) == 3 else face
+        gray = cv2.resize(gray, (64, 64))
+        
+        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        
+        magnitude = np.sqrt(sobelx**2 + sobely**2)
+        
+        grad_mean = np.mean(magnitude)
+        grad_std = np.std(magnitude)
+        
+        ratio = grad_std / (grad_mean + 1e-10)
+        score = min(1.0, ratio / 1.5)
+        
+        return score
+
+
 class FaceEncoder:
     def __init__(self):
         cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
         self.face_cascade = cv2.CascadeClassifier(cascade_path)
-        
-    def detect_face(self, image):
+        self.liveness_detector = LivenessDetector()
+    
+    def detect_face_rect(self, image):
+        """Returns (face_gray, (x, y, w, h)) or (None, None)"""
         if image is None:
-            return None
+            return None, None
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
         faces = self.face_cascade.detectMultiScale(gray, 1.1, 4, minSize=(60, 60))
         if len(faces) == 0:
-            return None
+            return None, None
         x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-        return gray[y:y+h, x:x+w]
+        return gray[y:y+h, x:x+w], (x, y, w, h)
+        
+    def detect_face(self, image):
+        face, _ = self.detect_face_rect(image)
+        return face
+    
+    def check_liveness(self, image):
+        """Check if face is real or photo. Returns (is_live, score, details)"""
+        _, face_rect = self.detect_face_rect(image)
+        if face_rect is None:
+            return False, 0.0, "No face detected"
+        return self.liveness_detector.check_liveness(image, face_rect)
     
     def get_encoding(self, image):
         if image is None:
@@ -644,11 +845,21 @@ class FaceVerificationApp(QMainWindow):
         faces = self.face_encoder.face_cascade.detectMultiScale(gray, 1.1, 4, minSize=(60, 60))
         
         for (x, y, w, h) in faces:
-            cv2.rectangle(frame_rgb, (x-2, y-2), (x+w+2, y+h+2), (102, 126, 234), 3)
+            is_live, score, _ = self.face_encoder.liveness_detector.check_liveness(image, (x, y, w, h))
+            
+            if is_live:
+                color = (46, 204, 113)
+                label = f"LIVE {score:.0%}"
+            else:
+                color = (231, 126, 34)
+                label = f"PHOTO {score:.0%}"
+            
+            cv2.rectangle(frame_rgb, (x-2, y-2), (x+w+2, y+h+2), color, 3)
             overlay = frame_rgb.copy()
-            cv2.rectangle(overlay, (x, y-30), (x+100, y), (102, 126, 234), -1)
-            cv2.addWeighted(overlay, 0.7, frame_rgb, 0.3, 0, frame_rgb)
-            cv2.putText(frame_rgb, "FACE", (x+5, y-8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            label_width = max(120, len(label) * 12)
+            cv2.rectangle(overlay, (x, y-30), (x+label_width, y), color, -1)
+            cv2.addWeighted(overlay, 0.8, frame_rgb, 0.2, 0, frame_rgb)
+            cv2.putText(frame_rgb, label, (x+5, y-8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         h, w, ch = frame_rgb.shape
         bytes_per_line = ch * w
@@ -748,12 +959,22 @@ class FaceVerificationApp(QMainWindow):
         locker.unlock()
         
         def verify_thread(img, faces):
+            is_live, liveness_score, liveness_details = self.face_encoder.check_liveness(img)
+            
+            if not is_live:
+                self.signals.verification_signal.emit("PHOTO DETECTED", "#e67e22")
+                self.signals.log_signal.emit(f"Spoof detected (score: {liveness_score:.2f})")
+                self.db.log_verification("SPOOF", "PHOTO_DETECTED", liveness_score)
+                return
+            
             current_encoding = self.face_encoder.get_encoding(img)
             
             if current_encoding is None:
                 self.signals.verification_signal.emit("NO FACE DETECTED", "#e74c3c")
                 self.signals.log_signal.emit("No face detected")
                 return
+            
+            self.signals.log_signal.emit(f"Liveness OK ({liveness_score:.0%})")
                 
             best_match = None
             best_similarity = 0
