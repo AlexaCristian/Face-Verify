@@ -298,8 +298,10 @@ class FaceVerificationApp(QMainWindow):
         
         self.setup_ui()
         self.reload_faces()
-        self.log("System initialized")
-        self.log(f"Database: {sum(len(v) for v in self.known_faces.values())} faces loaded")
+        self.log("System ready")
+        face_count = sum(len(v) for v in self.known_faces.values())
+        if face_count > 0:
+            self.log(f"{face_count} registered face(s)")
         
     def setup_ui(self):
         self.setStyleSheet("""
@@ -537,27 +539,6 @@ class FaceVerificationApp(QMainWindow):
         self.auto_verify_timer.timeout.connect(self.verify_face)
         
         right_layout.addWidget(verify_card)
-        
-        manage_card = self._create_card("Manage Persons")
-        manage_layout = manage_card.layout()
-        
-        self.list_btn = GlowButton("View All Registered", "#34495e")
-        self.list_btn.clicked.connect(self.list_persons)
-        manage_layout.addWidget(self.list_btn)
-        
-        delete_layout = QHBoxLayout()
-        delete_layout.setSpacing(10)
-        self.delete_name_entry = QLineEdit()
-        self.delete_name_entry.setPlaceholderText("Name to delete...")
-        delete_layout.addWidget(self.delete_name_entry)
-        
-        self.delete_btn = GlowButton("Delete", "#c0392b")
-        self.delete_btn.setFixedWidth(80)
-        self.delete_btn.clicked.connect(self.delete_person)
-        delete_layout.addWidget(self.delete_btn)
-        manage_layout.addLayout(delete_layout)
-        
-        right_layout.addWidget(manage_card)
         
         log_card = self._create_card("Activity Log")
         log_layout = log_card.layout()
