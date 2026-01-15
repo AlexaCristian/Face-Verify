@@ -2016,7 +2016,7 @@ class FaceVerificationApp(QMainWindow):
 
     def on_action_passed(self):
         self.log("Action check PASSED - face is live")
-        self.update_action_challenge_ui("PASSED!", 1.0, "passed")
+        self.update_action_challenge_ui("PASSED THE LIVECHECK!", 1.0, "passed")
         self._proceed_with_verification()
 
     def on_action_failed(self, reason):
@@ -2393,7 +2393,8 @@ class FaceVerificationApp(QMainWindow):
                 self.signals.log_signal.emit(f"Verified: {best_match} ({best_similarity:.1%}) [threshold: {self.verification_threshold:.0%}]")
                 QTimer.singleShot(100, self._stop_after_verification)
             else:
-                result_text = f"✗ UNKNOWN ({best_similarity:.0%}) ✗"
+                # result_text = f"✗ UNKNOWN ({best_similarity:.0%}) ✗"
+                result_text = f"✗ UNKNOWN ✗"
                 result_color = "#e74c3c"
                 result_status = "UNKNOWN"
                 if best_match:
