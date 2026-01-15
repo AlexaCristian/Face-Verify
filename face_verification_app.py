@@ -1,8 +1,6 @@
 """
 Face Verification System - Ring Camera Style
-=============================================
-A desktop application for face verification using machine learning.
-Uses local SQLite database - works immediately without external setup.
+Beautiful modern desktop application for face verification.
 """
 
 import sys
@@ -19,13 +17,12 @@ try:
     from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                  QHBoxLayout, QLabel, QPushButton, QLineEdit, 
                                  QTextEdit, QGroupBox, QMessageBox, QFileDialog,
-                                 QFrame, QCheckBox)
+                                 QFrame, QCheckBox, QSplitter, QScrollArea,
+                                 QGraphicsDropShadowEffect)
     from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QMutex, QMutexLocker
-    from PyQt5.QtGui import QImage, QPixmap, QFont, QPalette, QColor
+    from PyQt5.QtGui import QImage, QPixmap, QFont, QPalette, QColor, QLinearGradient, QPainter
 except ImportError as e:
     print(f"Missing required package: {e}")
-    print("\nPlease install required packages with:")
-    print("    pip install opencv-python numpy Pillow scipy PyQt5")
     sys.exit(1)
 
 
@@ -120,17 +117,13 @@ class FaceEncoder:
     def compare_faces(self, encoding1, encoding2):
         if encoding1 is None or encoding2 is None:
             return 0.0
-            
         e1 = np.array(encoding1)
         e2 = np.array(encoding2)
-        
         min_len = min(len(e1), len(e2))
         e1 = e1[:min_len]
         e2 = e2[:min_len]
-        
         e1 = e1 / (np.linalg.norm(e1) + 1e-10)
         e2 = e2 / (np.linalg.norm(e2) + 1e-10)
-        
         similarity = 1 - cosine(e1, e2)
         return max(0, min(1, similarity))
 
@@ -241,60 +234,55 @@ class SignalBridge(QObject):
     update_faces_signal = pyqtSignal()
 
 
+class GlowButton(QPushButton):
+    def __init__(self, text, color="#667eea", parent=None):
+        super().__init__(text, parent)
+        self.base_color = color
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 {color}, stop:1 {self._adjust_color(color, -30)});
+                color: white;
+                border: none;
+                padding: 12px 20px;
+                font-size: 13px;
+                font-weight: 600;
+                border-radius: 8px;
+                letter-spacing: 0.5px;
+            }}
+            QPushButton:hover {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 {self._adjust_color(color, 20)}, stop:1 {color});
+            }}
+            QPushButton:pressed {{
+                background: {self._adjust_color(color, -40)};
+            }}
+            QPushButton:disabled {{
+                background: #3a3a5c;
+                color: #666;
+            }}
+        """)
+        
+    def _adjust_color(self, color, amount):
+        c = QColor(color)
+        h, s, l, a = c.getHsl()
+        l = max(0, min(255, l + amount))
+        c.setHsl(h, s, l, a)
+        return c.name()
+
+
 class FaceVerificationApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Face Verification System")
-        self.setGeometry(100, 100, 1200, 800)
-        self.setMinimumSize(1000, 700)
-        self.setStyleSheet("""
-            QMainWindow { background-color: #1a1a2e; }
-            QLabel { color: white; font-family: 'Segoe UI'; }
-            QPushButton { 
-                background-color: #0f3460; 
-                color: white; 
-                border: none; 
-                padding: 10px; 
-                font-size: 12px;
-                border-radius: 5px;
-            }
-            QPushButton:hover { background-color: #16537e; }
-            QPushButton:disabled { background-color: #555; color: #888; }
-            QLineEdit { 
-                background-color: #0f0f23; 
-                color: white; 
-                border: 1px solid #333; 
-                padding: 8px;
-                border-radius: 3px;
-            }
-            QTextEdit { 
-                background-color: #0f0f23; 
-                color: #00ff88; 
-                border: 1px solid #333;
-                font-family: 'Consolas', monospace;
-            }
-            QGroupBox { 
-                color: white; 
-                font-weight: bold; 
-                border: 2px solid #333;
-                border-radius: 5px;
-                margin-top: 10px;
-                padding-top: 10px;
-            }
-            QGroupBox::title { 
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 3px;
-            }
-            QCheckBox { color: white; }
-        """)
+        self.setGeometry(50, 50, 1300, 850)
+        self.setMinimumSize(1100, 750)
         
         self.db = LocalDatabase()
         self.cap = None
         self.is_running = False
         self.known_faces = {}
         self.verification_threshold = 0.70
-        self.current_frame = None
         self.current_image = None
         self.frame_mutex = QMutex()
         self.timer = QTimer()
@@ -310,99 +298,234 @@ class FaceVerificationApp(QMainWindow):
         
         self.setup_ui()
         self.reload_faces()
-        self.log("Application started - Local SQLite database ready")
-        self.log(f"Loaded {sum(len(v) for v in self.known_faces.values())} registered face(s)")
+        self.log("System initialized")
+        self.log(f"Database: {sum(len(v) for v in self.known_faces.values())} faces loaded")
         
     def setup_ui(self):
+        self.setStyleSheet("""
+            QMainWindow {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #0f0c29, stop:0.5 #302b63, stop:1 #24243e);
+            }
+            QLabel {
+                color: #e0e0e0;
+                font-family: 'Segoe UI', Arial, sans-serif;
+            }
+            QLineEdit {
+                background: rgba(255, 255, 255, 0.08);
+                border: 2px solid rgba(255, 255, 255, 0.1);
+                border-radius: 8px;
+                padding: 10px 15px;
+                color: white;
+                font-size: 13px;
+                selection-background-color: #667eea;
+            }
+            QLineEdit:focus {
+                border: 2px solid #667eea;
+                background: rgba(255, 255, 255, 0.12);
+            }
+            QLineEdit::placeholder {
+                color: rgba(255, 255, 255, 0.4);
+            }
+            QTextEdit {
+                background: rgba(0, 0, 0, 0.3);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 8px;
+                color: #00ff88;
+                font-family: 'Consolas', 'Monaco', monospace;
+                font-size: 11px;
+                padding: 8px;
+            }
+            QCheckBox {
+                color: #e0e0e0;
+                font-size: 12px;
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border-radius: 4px;
+                border: 2px solid rgba(255, 255, 255, 0.3);
+                background: transparent;
+            }
+            QCheckBox::indicator:checked {
+                background: #667eea;
+                border-color: #667eea;
+            }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 8px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255, 255, 255, 0.3);
+                border-radius: 4px;
+                min-height: 30px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+        """)
+        
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(20)
+        main_layout.setContentsMargins(25, 25, 25, 25)
+        main_layout.setSpacing(25)
         
         left_panel = QFrame()
-        left_panel.setStyleSheet("background-color: #16213e; border-radius: 10px;")
+        left_panel.setStyleSheet("""
+            QFrame {
+                background: rgba(255, 255, 255, 0.05);
+                border-radius: 20px;
+                border: 1px solid rgba(255, 255, 255, 0.1);
+            }
+        """)
         left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(15, 15, 15, 15)
+        left_layout.setContentsMargins(25, 25, 25, 25)
+        left_layout.setSpacing(15)
         
-        header = QLabel("Face Verification System")
-        header.setFont(QFont("Segoe UI", 18, QFont.Bold))
-        header.setStyleSheet("color: #00d4ff; background: transparent;")
+        title_widget = QWidget()
+        title_layout = QVBoxLayout(title_widget)
+        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(5)
+        
+        header = QLabel("Face Verification")
+        header.setFont(QFont("Segoe UI", 28, QFont.Bold))
+        header.setStyleSheet("""
+            color: transparent;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                stop:0 #667eea, stop:1 #764ba2);
+            background-clip: text;
+            -webkit-background-clip: text;
+            color: #667eea;
+        """)
         header.setAlignment(Qt.AlignCenter)
-        left_layout.addWidget(header)
+        title_layout.addWidget(header)
+        
+        subtitle = QLabel("AI-Powered Security System")
+        subtitle.setFont(QFont("Segoe UI", 11))
+        subtitle.setStyleSheet("color: rgba(255, 255, 255, 0.5);")
+        subtitle.setAlignment(Qt.AlignCenter)
+        title_layout.addWidget(subtitle)
+        
+        left_layout.addWidget(title_widget)
+        
+        image_container = QFrame()
+        image_container.setStyleSheet("""
+            QFrame {
+                background: rgba(0, 0, 0, 0.4);
+                border-radius: 15px;
+                border: 2px solid rgba(255, 255, 255, 0.1);
+            }
+        """)
+        image_layout = QVBoxLayout(image_container)
+        image_layout.setContentsMargins(3, 3, 3, 3)
         
         self.image_label = QLabel()
-        self.image_label.setMinimumSize(640, 480)
-        self.image_label.setStyleSheet("background-color: #0f0f23; border-radius: 5px; border: 2px solid #333;")
+        self.image_label.setMinimumSize(600, 450)
+        self.image_label.setStyleSheet("""
+            background: transparent;
+            border-radius: 12px;
+        """)
         self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setText("No Image\n\nLoad an image or start camera")
-        left_layout.addWidget(self.image_label)
+        self.image_label.setText("No Image Loaded")
+        self.image_label.setFont(QFont("Segoe UI", 14))
+        image_layout.addWidget(self.image_label)
         
-        self.status_label = QLabel("Status: Ready")
-        self.status_label.setFont(QFont("Segoe UI", 11))
-        self.status_label.setStyleSheet("color: #00ff88; background: transparent;")
+        left_layout.addWidget(image_container)
+        
+        status_widget = QFrame()
+        status_widget.setStyleSheet("""
+            QFrame {
+                background: rgba(255, 255, 255, 0.05);
+                border-radius: 12px;
+                padding: 10px;
+            }
+        """)
+        status_layout = QVBoxLayout(status_widget)
+        status_layout.setContentsMargins(15, 10, 15, 10)
+        status_layout.setSpacing(8)
+        
+        self.status_label = QLabel("Ready")
+        self.status_label.setFont(QFont("Segoe UI", 12))
+        self.status_label.setStyleSheet("color: #00ff88;")
         self.status_label.setAlignment(Qt.AlignCenter)
-        left_layout.addWidget(self.status_label)
+        status_layout.addWidget(self.status_label)
         
         self.verification_label = QLabel("")
-        self.verification_label.setFont(QFont("Segoe UI", 16, QFont.Bold))
-        self.verification_label.setStyleSheet("background: transparent;")
+        self.verification_label.setFont(QFont("Segoe UI", 22, QFont.Bold))
         self.verification_label.setAlignment(Qt.AlignCenter)
         self.verification_label.setMinimumHeight(50)
-        left_layout.addWidget(self.verification_label)
+        status_layout.addWidget(self.verification_label)
         
+        left_layout.addWidget(status_widget)
         main_layout.addWidget(left_panel, stretch=2)
         
         right_panel = QFrame()
         right_panel.setFixedWidth(380)
-        right_panel.setStyleSheet("background-color: #16213e; border-radius: 10px;")
+        right_panel.setStyleSheet("""
+            QFrame {
+                background: rgba(255, 255, 255, 0.03);
+                border-radius: 20px;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+            }
+        """)
         right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(10, 10, 10, 10)
-        right_layout.setSpacing(10)
+        right_layout.setContentsMargins(20, 20, 20, 20)
+        right_layout.setSpacing(15)
         
-        source_group = QGroupBox("Image Source")
-        source_layout = QVBoxLayout(source_group)
+        source_card = self._create_card("Image Source")
+        source_layout = source_card.layout()
         
-        self.load_image_btn = QPushButton("Load Image from File")
-        self.load_image_btn.setStyleSheet("background-color: #1e88e5;")
+        self.load_image_btn = GlowButton("Load Image from File", "#3498db")
         self.load_image_btn.clicked.connect(self.load_image)
         source_layout.addWidget(self.load_image_btn)
         
         cam_layout = QHBoxLayout()
-        self.start_cam_btn = QPushButton("Start Camera")
-        self.start_cam_btn.setStyleSheet("background-color: #2e7d32;")
+        cam_layout.setSpacing(10)
+        self.start_cam_btn = GlowButton("Start Camera", "#27ae60")
         self.start_cam_btn.clicked.connect(self.start_camera)
         cam_layout.addWidget(self.start_cam_btn)
         
-        self.stop_cam_btn = QPushButton("Stop Camera")
-        self.stop_cam_btn.setStyleSheet("background-color: #c62828;")
+        self.stop_cam_btn = GlowButton("Stop", "#e74c3c")
         self.stop_cam_btn.clicked.connect(self.stop_camera)
         self.stop_cam_btn.setEnabled(False)
+        self.stop_cam_btn.setFixedWidth(80)
         cam_layout.addWidget(self.stop_cam_btn)
         source_layout.addLayout(cam_layout)
         
-        right_layout.addWidget(source_group)
+        right_layout.addWidget(source_card)
         
-        register_group = QGroupBox("Register New Face")
-        register_layout = QVBoxLayout(register_group)
+        register_card = self._create_card("Register Face")
+        register_layout = register_card.layout()
         
-        register_layout.addWidget(QLabel("Person Name:"))
+        name_label = QLabel("Person Name")
+        name_label.setStyleSheet("color: rgba(255, 255, 255, 0.7); font-size: 11px; margin-bottom: 2px;")
+        register_layout.addWidget(name_label)
+        
         self.person_name_entry = QLineEdit()
-        self.person_name_entry.setPlaceholderText("Enter person's name...")
+        self.person_name_entry.setPlaceholderText("Enter name...")
         register_layout.addWidget(self.person_name_entry)
         
-        self.register_btn = QPushButton("Register Current Face")
-        self.register_btn.setStyleSheet("background-color: #6a1b9a;")
+        self.register_btn = GlowButton("Register Current Face", "#9b59b6")
         self.register_btn.clicked.connect(self.register_face)
         register_layout.addWidget(self.register_btn)
         
-        right_layout.addWidget(register_group)
+        right_layout.addWidget(register_card)
         
-        verify_group = QGroupBox("Verify Identity")
-        verify_layout = QVBoxLayout(verify_group)
+        verify_card = self._create_card("Verify Identity")
+        verify_layout = verify_card.layout()
         
-        self.verify_btn = QPushButton("Verify Current Face")
-        self.verify_btn.setStyleSheet("background-color: #00897b; font-weight: bold; font-size: 14px; padding: 15px;")
+        self.verify_btn = GlowButton("VERIFY FACE", "#667eea")
+        self.verify_btn.setStyleSheet(self.verify_btn.styleSheet() + """
+            QPushButton {
+                font-size: 16px;
+                padding: 18px;
+                font-weight: 700;
+                letter-spacing: 2px;
+            }
+        """)
         self.verify_btn.clicked.connect(self.verify_face)
         verify_layout.addWidget(self.verify_btn)
         
@@ -413,41 +536,61 @@ class FaceVerificationApp(QMainWindow):
         self.auto_verify_timer = QTimer()
         self.auto_verify_timer.timeout.connect(self.verify_face)
         
-        right_layout.addWidget(verify_group)
+        right_layout.addWidget(verify_card)
         
-        manage_group = QGroupBox("Manage Faces")
-        manage_layout = QVBoxLayout(manage_group)
+        manage_card = self._create_card("Manage Persons")
+        manage_layout = manage_card.layout()
         
-        self.list_btn = QPushButton("List Registered Persons")
+        self.list_btn = GlowButton("View All Registered", "#34495e")
         self.list_btn.clicked.connect(self.list_persons)
         manage_layout.addWidget(self.list_btn)
         
         delete_layout = QHBoxLayout()
+        delete_layout.setSpacing(10)
         self.delete_name_entry = QLineEdit()
         self.delete_name_entry.setPlaceholderText("Name to delete...")
         delete_layout.addWidget(self.delete_name_entry)
         
-        self.delete_btn = QPushButton("Delete")
-        self.delete_btn.setStyleSheet("background-color: #c62828;")
+        self.delete_btn = GlowButton("Delete", "#c0392b")
+        self.delete_btn.setFixedWidth(80)
         self.delete_btn.clicked.connect(self.delete_person)
         delete_layout.addWidget(self.delete_btn)
         manage_layout.addLayout(delete_layout)
         
-        right_layout.addWidget(manage_group)
+        right_layout.addWidget(manage_card)
         
-        log_group = QGroupBox("Activity Log")
-        log_layout = QVBoxLayout(log_group)
+        log_card = self._create_card("Activity Log")
+        log_layout = log_card.layout()
         
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setFont(QFont("Consolas", 9))
-        self.log_text.setMaximumHeight(150)
+        self.log_text.setMaximumHeight(120)
         log_layout.addWidget(self.log_text)
         
-        right_layout.addWidget(log_group)
+        right_layout.addWidget(log_card)
         right_layout.addStretch()
         
         main_layout.addWidget(right_panel)
+        
+    def _create_card(self, title):
+        card = QFrame()
+        card.setStyleSheet("""
+            QFrame {
+                background: rgba(255, 255, 255, 0.05);
+                border-radius: 15px;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+            }
+        """)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 15, 18, 18)
+        layout.setSpacing(12)
+        
+        title_label = QLabel(title)
+        title_label.setFont(QFont("Segoe UI", 13, QFont.Bold))
+        title_label.setStyleSheet("color: white; border: none; background: transparent;")
+        layout.addWidget(title_label)
+        
+        return card
         
     def reload_faces(self):
         self.known_faces = self.db.get_all_faces()
@@ -468,11 +611,11 @@ class FaceVerificationApp(QMainWindow):
         
     def update_status(self, text, color):
         self.status_label.setText(text)
-        self.status_label.setStyleSheet(f"color: {color}; background: transparent;")
+        self.status_label.setStyleSheet(f"color: {color};")
         
     def update_verification(self, text, color):
         self.verification_label.setText(text)
-        self.verification_label.setStyleSheet(f"color: {color}; background: transparent; font-size: 18px;")
+        self.verification_label.setStyleSheet(f"color: {color}; font-size: 24px;")
         
     def show_message(self, msg_type, title, message):
         if msg_type == "info":
@@ -510,8 +653,8 @@ class FaceVerificationApp(QMainWindow):
         locker.unlock()
         
         self.display_image(image)
-        self.log(f"Loaded image: {os.path.basename(file_path)}")
-        self.update_status("Status: Image loaded", "#00ff88")
+        self.log(f"Loaded: {os.path.basename(file_path)}")
+        self.update_status("Image loaded", "#00ff88")
         
     def display_image(self, image):
         frame_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -520,8 +663,11 @@ class FaceVerificationApp(QMainWindow):
         faces = self.face_encoder.face_cascade.detectMultiScale(gray, 1.1, 4, minSize=(60, 60))
         
         for (x, y, w, h) in faces:
-            cv2.rectangle(frame_rgb, (x, y), (x+w, y+h), (0, 255, 0), 3)
-            cv2.putText(frame_rgb, "Face", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.rectangle(frame_rgb, (x-2, y-2), (x+w+2, y+h+2), (102, 126, 234), 3)
+            overlay = frame_rgb.copy()
+            cv2.rectangle(overlay, (x, y-30), (x+100, y), (102, 126, 234), -1)
+            cv2.addWeighted(overlay, 0.7, frame_rgb, 0.3, 0, frame_rgb)
+            cv2.putText(frame_rgb, "FACE", (x+5, y-8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         h, w, ch = frame_rgb.shape
         bytes_per_line = ch * w
@@ -540,13 +686,13 @@ class FaceVerificationApp(QMainWindow):
             self.is_running = True
             self.start_cam_btn.setEnabled(False)
             self.stop_cam_btn.setEnabled(True)
-            self.update_status("Status: Camera Running", "#00ff88")
+            self.update_status("Camera active", "#00ff88")
             self.log("Camera started")
             self.timer.start(33)
         else:
-            self.log("No camera found - use 'Load Image' instead")
-            self.update_status("Status: No camera available", "#ff6b6b")
-            QMessageBox.warning(self, "Camera", "No camera detected.\n\nUse 'Load Image from File' to test with photos.")
+            self.log("No camera found")
+            self.update_status("No camera", "#ff6b6b")
+            QMessageBox.warning(self, "Camera", "No camera detected.\n\nUse 'Load Image' to test with photos.")
             
     def stop_camera(self):
         self.is_running = False
@@ -556,7 +702,7 @@ class FaceVerificationApp(QMainWindow):
             self.cap = None
         self.start_cam_btn.setEnabled(True)
         self.stop_cam_btn.setEnabled(False)
-        self.update_status("Status: Camera stopped", "#ffaa00")
+        self.update_status("Camera stopped", "#ffaa00")
         self.log("Camera stopped")
         
     def update_frame(self):
@@ -579,7 +725,7 @@ class FaceVerificationApp(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please enter a person name")
             return
             
-        self.log(f"Registering face for: {name}")
+        self.log(f"Registering: {name}")
         
         def register_thread(img, person_name):
             encoding = self.face_encoder.get_encoding(img)
@@ -594,11 +740,10 @@ class FaceVerificationApp(QMainWindow):
                     self.signals.log_signal.emit(f"Registered: {person_name}")
                     self.signals.message_signal.emit("info", "Success", f"Face registered for {person_name}")
                 except Exception as e:
-                    self.signals.log_signal.emit(f"Error: {str(e)}")
                     self.signals.message_signal.emit("error", "Error", f"Failed: {str(e)}")
             else:
-                self.signals.log_signal.emit(f"No face detected for: {person_name}")
-                self.signals.message_signal.emit("error", "Error", "No face detected in the image.\n\nMake sure a face is clearly visible.")
+                self.signals.log_signal.emit("No face detected")
+                self.signals.message_signal.emit("error", "Error", "No face detected in the image.")
                 
         threading.Thread(target=register_thread, args=(image, name), daemon=True).start()
         
@@ -606,7 +751,7 @@ class FaceVerificationApp(QMainWindow):
         image = self.get_current_image()
         if image is None:
             if not self.auto_verify_cb.isChecked():
-                QMessageBox.warning(self, "Warning", "No image loaded.\n\nLoad an image or start the camera first.")
+                QMessageBox.warning(self, "Warning", "No image loaded.")
             return
             
         if not self.known_faces:
@@ -614,8 +759,8 @@ class FaceVerificationApp(QMainWindow):
                 QMessageBox.warning(self, "Warning", "No registered faces.\n\nRegister someone first.")
             return
             
-        self.verification_label.setText("Verifying...")
-        self.verification_label.setStyleSheet("color: #ffff00; background: transparent;")
+        self.verification_label.setText("Analyzing...")
+        self.verification_label.setStyleSheet("color: #f1c40f; font-size: 24px;")
         
         locker = QMutexLocker(self.frame_mutex)
         faces_snapshot = {k: [{'encoding': f['encoding'].copy()} for f in v] for k, v in self.known_faces.items()}
@@ -625,7 +770,7 @@ class FaceVerificationApp(QMainWindow):
             current_encoding = self.face_encoder.get_encoding(img)
             
             if current_encoding is None:
-                self.signals.verification_signal.emit("NO FACE DETECTED", "#ff6b6b")
+                self.signals.verification_signal.emit("NO FACE DETECTED", "#e74c3c")
                 self.signals.log_signal.emit("No face detected")
                 return
                 
@@ -643,12 +788,12 @@ class FaceVerificationApp(QMainWindow):
                         
             if best_similarity > self.verification_threshold:
                 result_text = f"VERIFIED: {best_match}"
-                result_color = "#00ff88"
+                result_color = "#2ecc71"
                 result_status = "VERIFIED"
                 self.signals.log_signal.emit(f"Verified: {best_match} ({best_similarity:.1%})")
             else:
                 result_text = "UNKNOWN PERSON"
-                result_color = "#ff6b6b"
+                result_color = "#e74c3c"
                 result_status = "UNKNOWN"
                 if best_match:
                     self.signals.log_signal.emit(f"Unknown (closest: {best_match} at {best_similarity:.1%})")
@@ -664,11 +809,11 @@ class FaceVerificationApp(QMainWindow):
         rows = self.db.get_persons_list()
         
         if not rows:
-            QMessageBox.information(self, "Registered Persons", "No persons registered yet.\n\nUse 'Register Current Face' to add someone.")
+            QMessageBox.information(self, "Registered Persons", "No persons registered yet.")
             return
             
-        persons_list = "\n".join([f"- {row[0]} ({row[1]} face(s))" for row in rows])
-        QMessageBox.information(self, "Registered Persons", f"Registered faces:\n\n{persons_list}")
+        persons_list = "\n".join([f"  {row[0]} - {row[1]} face(s)" for row in rows])
+        QMessageBox.information(self, "Registered Persons", f"Registered:\n\n{persons_list}")
         
     def delete_person(self):
         name = self.delete_name_entry.text().strip()
@@ -676,8 +821,8 @@ class FaceVerificationApp(QMainWindow):
             QMessageBox.warning(self, "Warning", "Enter a name to delete")
             return
             
-        reply = QMessageBox.question(self, "Confirm Delete", 
-            f"Delete all faces for '{name}'?",
+        reply = QMessageBox.question(self, "Confirm", 
+            f"Delete '{name}'?",
             QMessageBox.Yes | QMessageBox.No)
             
         if reply == QMessageBox.Yes:
@@ -696,28 +841,22 @@ def main():
     app.setStyle('Fusion')
     
     dark_palette = QPalette()
-    dark_palette.setColor(QPalette.Window, QColor(26, 26, 46))
+    dark_palette.setColor(QPalette.Window, QColor(15, 12, 41))
     dark_palette.setColor(QPalette.WindowText, Qt.white)
-    dark_palette.setColor(QPalette.Base, QColor(15, 15, 35))
-    dark_palette.setColor(QPalette.AlternateBase, QColor(26, 26, 46))
-    dark_palette.setColor(QPalette.ToolTipBase, Qt.white)
-    dark_palette.setColor(QPalette.ToolTipText, Qt.white)
+    dark_palette.setColor(QPalette.Base, QColor(20, 20, 40))
+    dark_palette.setColor(QPalette.AlternateBase, QColor(30, 30, 50))
     dark_palette.setColor(QPalette.Text, Qt.white)
-    dark_palette.setColor(QPalette.Button, QColor(15, 52, 96))
+    dark_palette.setColor(QPalette.Button, QColor(102, 126, 234))
     dark_palette.setColor(QPalette.ButtonText, Qt.white)
-    dark_palette.setColor(QPalette.BrightText, Qt.red)
-    dark_palette.setColor(QPalette.Link, QColor(0, 212, 255))
-    dark_palette.setColor(QPalette.Highlight, QColor(0, 212, 255))
-    dark_palette.setColor(QPalette.HighlightedText, Qt.black)
+    dark_palette.setColor(QPalette.Highlight, QColor(102, 126, 234))
+    dark_palette.setColor(QPalette.HighlightedText, Qt.white)
     app.setPalette(dark_palette)
     
     window = FaceVerificationApp()
     window.show()
     
     print("\n" + "="*50)
-    print("Face Verification System - Ready!")
-    print("="*50)
-    print("Using local SQLite database (faces.db)")
+    print("Face Verification System")
     print("="*50 + "\n")
     
     sys.exit(app.exec_())
