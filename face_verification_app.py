@@ -17,25 +17,27 @@ Make sure your SQL Server has:
 
 import sys
 import os
-import cv2
-import numpy as np
-import pyodbc
-import threading
-from datetime import datetime
-from PIL import Image
-from scipy.spatial.distance import cosine
 
 try:
+    import cv2
+    import numpy as np
+    import pyodbc
+    from scipy.spatial.distance import cosine
+    from PIL import Image
     from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                  QHBoxLayout, QLabel, QPushButton, QLineEdit, 
                                  QTextEdit, QGroupBox, QMessageBox, QFileDialog,
-                                 QFrame, QSlider)
-    from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
+                                 QFrame)
+    from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QMutex, QMutexLocker
     from PyQt5.QtGui import QImage, QPixmap, QFont, QPalette, QColor
-    PYQT_AVAILABLE = True
-except ImportError:
-    PYQT_AVAILABLE = False
-    print("PyQt5 not available. Install with: pip install PyQt5")
+except ImportError as e:
+    print(f"Missing required package: {e}")
+    print("\nPlease install required packages with:")
+    print("    pip install opencv-python numpy pyodbc Pillow scipy PyQt5")
+    sys.exit(1)
+
+import threading
+from datetime import datetime
 
 
 class FaceEncoder:
@@ -54,6 +56,8 @@ class FaceEncoder:
         return gray[y:y+h, x:x+w]
     
     def get_encoding(self, image):
+        if image is None:
+            return None
         face = self.detect_face(image)
         if face is None:
             return None
@@ -201,8 +205,11 @@ class FaceVerificationApp(QMainWindow):
         self.is_running = False
         self.known_faces = {}
         self.db_connection = None
+        self.db_config = {}
         self.verification_threshold = 0.70
         self.current_frame = None
+        self.frame_mutex = QMutex()
+        self.db_mutex = QMutex()
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
         self.face_encoder = FaceEncoder()
@@ -406,6 +413,21 @@ class FaceVerificationApp(QMainWindow):
             
     def log(self, message):
         self.signals.log_signal.emit(message)
+    
+    def get_thread_safe_frame(self):
+        locker = QMutexLocker(self.frame_mutex)
+        if self.current_frame is not None:
+            return self.current_frame.copy()
+        return None
+    
+    def get_db_connection_string(self):
+        if self.db_config.get('username'):
+            return f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={self.db_config['server']};DATABASE={self.db_config['database']};UID={self.db_config['username']};PWD={self.db_config['password']}"
+        else:
+            return f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={self.db_config['server']};DATABASE={self.db_config['database']};Trusted_Connection=yes"
+    
+    def get_thread_db_connection(self):
+        return pyodbc.connect(self.get_db_connection_string(), timeout=10)
         
     def load_config(self):
         config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db_config.txt")
@@ -435,14 +457,16 @@ class FaceVerificationApp(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please enter server and database name")
             return
         
+        self.db_config = {
+            'server': server,
+            'database': database,
+            'username': username,
+            'password': password
+        }
+        
         try:
-            if username:
-                conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={server};DATABASE={database};UID={username};PWD={password}"
-            else:
-                conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={server};DATABASE={database};Trusted_Connection=yes"
-            
             self.log(f"Connecting to {server}...")
-            self.db_connection = pyodbc.connect(conn_str, timeout=10)
+            self.db_connection = pyodbc.connect(self.get_db_connection_string(), timeout=10)
             self.create_tables()
             self.load_known_faces()
             self.db_status_label.setText("Connected")
@@ -546,7 +570,9 @@ class FaceVerificationApp(QMainWindow):
         if self.is_running and self.cap:
             ret, frame = self.cap.read()
             if ret:
+                locker = QMutexLocker(self.frame_mutex)
                 self.current_frame = frame.copy()
+                locker.unlock()
                 
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 
@@ -566,7 +592,8 @@ class FaceVerificationApp(QMainWindow):
                 self.camera_label.setPixmap(scaled_pixmap)
                 
     def capture_and_register(self):
-        if self.current_frame is None:
+        frame = self.get_thread_safe_frame()
+        if frame is None:
             QMessageBox.warning(self, "Warning", "No frame captured.\n\nStart the camera first.")
             return
             
@@ -581,37 +608,41 @@ class FaceVerificationApp(QMainWindow):
             
         self.log(f"Registering face for: {name}")
         
-        def register_thread():
-            encoding = self.face_encoder.get_encoding(self.current_frame)
+        def register_thread(frame_copy, person_name):
+            encoding = self.face_encoder.get_encoding(frame_copy)
             
             if encoding is not None:
                 encoding_str = ','.join([str(x) for x in encoding])
                 
-                _, buffer = cv2.imencode('.jpg', self.current_frame)
+                _, buffer = cv2.imencode('.jpg', frame_copy)
                 image_bytes = buffer.tobytes()
                 
                 try:
-                    cursor = self.db_connection.cursor()
+                    conn = self.get_thread_db_connection()
+                    cursor = conn.cursor()
                     cursor.execute(
                         "INSERT INTO RegisteredFaces (person_name, face_encoding, face_image) VALUES (?, ?, ?)",
-                        (name, encoding_str, image_bytes)
+                        (person_name, encoding_str, image_bytes)
                     )
-                    self.db_connection.commit()
+                    conn.commit()
+                    conn.close()
                     
-                    if name not in self.known_faces:
-                        self.known_faces[name] = []
-                    self.known_faces[name].append({'encoding': encoding})
+                    locker = QMutexLocker(self.db_mutex)
+                    if person_name not in self.known_faces:
+                        self.known_faces[person_name] = []
+                    self.known_faces[person_name].append({'encoding': encoding})
+                    locker.unlock()
                     
-                    self.signals.log_signal.emit(f"Successfully registered: {name}")
-                    self.signals.message_signal.emit("info", "Success", f"Face registered for {name}")
+                    self.signals.log_signal.emit(f"Successfully registered: {person_name}")
+                    self.signals.message_signal.emit("info", "Success", f"Face registered for {person_name}")
                 except Exception as e:
                     self.signals.log_signal.emit(f"Database error: {str(e)}")
                     self.signals.message_signal.emit("error", "Error", f"Failed to save: {str(e)}")
             else:
-                self.signals.log_signal.emit(f"No face detected for: {name}")
+                self.signals.log_signal.emit(f"No face detected for: {person_name}")
                 self.signals.message_signal.emit("error", "Error", "No face detected in the frame.\n\nMake sure your face is visible to the camera.")
                 
-        threading.Thread(target=register_thread, daemon=True).start()
+        threading.Thread(target=register_thread, args=(frame, name), daemon=True).start()
         
     def import_face_from_image(self):
         name = self.person_name_entry.text().strip()
@@ -635,8 +666,8 @@ class FaceVerificationApp(QMainWindow):
             
         self.log(f"Importing face for: {name}")
         
-        def import_thread():
-            image = cv2.imread(file_path)
+        def import_thread(path, person_name):
+            image = cv2.imread(path)
             if image is None:
                 self.signals.message_signal.emit("error", "Error", "Could not read the image file")
                 return
@@ -646,33 +677,38 @@ class FaceVerificationApp(QMainWindow):
             if encoding is not None:
                 encoding_str = ','.join([str(x) for x in encoding])
                 
-                with open(file_path, 'rb') as f:
+                with open(path, 'rb') as f:
                     image_bytes = f.read()
                 
                 try:
-                    cursor = self.db_connection.cursor()
+                    conn = self.get_thread_db_connection()
+                    cursor = conn.cursor()
                     cursor.execute(
                         "INSERT INTO RegisteredFaces (person_name, face_encoding, face_image) VALUES (?, ?, ?)",
-                        (name, encoding_str, image_bytes)
+                        (person_name, encoding_str, image_bytes)
                     )
-                    self.db_connection.commit()
+                    conn.commit()
+                    conn.close()
                     
-                    if name not in self.known_faces:
-                        self.known_faces[name] = []
-                    self.known_faces[name].append({'encoding': encoding})
+                    locker = QMutexLocker(self.db_mutex)
+                    if person_name not in self.known_faces:
+                        self.known_faces[person_name] = []
+                    self.known_faces[person_name].append({'encoding': encoding})
+                    locker.unlock()
                     
-                    self.signals.log_signal.emit(f"Successfully imported: {name}")
-                    self.signals.message_signal.emit("info", "Success", f"Face imported for {name}")
+                    self.signals.log_signal.emit(f"Successfully imported: {person_name}")
+                    self.signals.message_signal.emit("info", "Success", f"Face imported for {person_name}")
                 except Exception as e:
                     self.signals.message_signal.emit("error", "Error", f"Database error: {str(e)}")
             else:
-                self.signals.log_signal.emit(f"No face detected in image for: {name}")
+                self.signals.log_signal.emit(f"No face detected in image for: {person_name}")
                 self.signals.message_signal.emit("error", "Error", "No face detected in the selected image")
                 
-        threading.Thread(target=import_thread, daemon=True).start()
+        threading.Thread(target=import_thread, args=(file_path, name), daemon=True).start()
         
     def verify_face(self):
-        if self.current_frame is None:
+        frame = self.get_thread_safe_frame()
+        if frame is None:
             if not self.auto_verify:
                 QMessageBox.warning(self, "Warning", "No frame captured.\n\nStart the camera first.")
             return
@@ -685,8 +721,12 @@ class FaceVerificationApp(QMainWindow):
         self.verification_label.setText("Verifying...")
         self.verification_label.setStyleSheet("color: #ffff00; background: transparent;")
         
-        def verify_thread():
-            current_encoding = self.face_encoder.get_encoding(self.current_frame)
+        locker = QMutexLocker(self.db_mutex)
+        known_faces_copy = {k: [{'encoding': f['encoding'].copy()} for f in v] for k, v in self.known_faces.items()}
+        locker.unlock()
+        
+        def verify_thread(frame_copy, faces_snapshot):
+            current_encoding = self.face_encoder.get_encoding(frame_copy)
             
             if current_encoding is None:
                 self.signals.verification_signal.emit("NO FACE DETECTED", "#ff6b6b")
@@ -695,7 +735,7 @@ class FaceVerificationApp(QMainWindow):
             best_match = None
             best_similarity = 0
             
-            for name, face_list in self.known_faces.items():
+            for name, face_list in faces_snapshot.items():
                 for face_data in face_list:
                     known_encoding = face_data['encoding']
                     similarity = self.face_encoder.compare_faces(current_encoding, known_encoding)
@@ -718,20 +758,22 @@ class FaceVerificationApp(QMainWindow):
                 else:
                     self.signals.log_signal.emit("Unknown person detected")
                 
-            if self.db_connection:
+            if self.db_config:
                 try:
-                    cursor = self.db_connection.cursor()
+                    conn = self.get_thread_db_connection()
+                    cursor = conn.cursor()
                     cursor.execute(
                         "INSERT INTO VerificationLog (person_name, verification_result, confidence) VALUES (?, ?, ?)",
                         (best_match or "Unknown", result_status, best_similarity)
                     )
-                    self.db_connection.commit()
+                    conn.commit()
+                    conn.close()
                 except:
                     pass
                 
             self.signals.verification_signal.emit(result_text, result_color)
             
-        threading.Thread(target=verify_thread, daemon=True).start()
+        threading.Thread(target=verify_thread, args=(frame, known_faces_copy), daemon=True).start()
         
     def list_persons(self):
         if not self.db_connection:
@@ -762,10 +804,6 @@ class FaceVerificationApp(QMainWindow):
 
 
 def main():
-    if not PYQT_AVAILABLE:
-        print("ERROR: PyQt5 is required. Install with: pip install PyQt5")
-        sys.exit(1)
-        
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     
